@@ -7,6 +7,9 @@ local DISCORD_API = "https://discord.com/api/v10"
 local lastSeenMessageId = nil
 local pollThread = nil
 local isPolling = false
+local rateLimitResetAt = 0
+local consecutiveErrors = 0
+local MAX_BACKOFF = 120
 
 local pluginId = "NebulaRobloxAssistant"
 
@@ -208,14 +211,16 @@ saveBtn.MouseButton1Click:Connect(function()
 	SETTINGS.ChannelId = channelBox.Text
 	setSetting("BotToken", SETTINGS.BotToken)
 	setSetting("ChannelId", SETTINGS.ChannelId)
-	statusLabel.Text = "Status: Settings saved"
-	task.delay(2, function()
-		if statusLabel.Text == "Status: Settings saved" then
+	statusLabel.Text = "Status: Settings saved -- allow HTTP permissions if prompted"
+	task.delay(4, function()
+		if statusLabel.Text == "Status: Settings saved -- allow HTTP permissions if prompted" then
 			statusLabel.Text = isPolling and "Status: Monitoring..." or "Status: Ready (start polling)"
 		end
 	end)
 	if SETTINGS.AutoRefresh and SETTINGS.BotToken ~= "" and SETTINGS.ChannelId ~= "" then
 		lastSeenMessageId = nil
+		consecutiveErrors = 0
+		rateLimitResetAt = 0
 		startPolling()
 	end
 end)
@@ -261,23 +266,53 @@ end
 local function parseSnippetMessage(content)
 	local title, url = content:match("NEBULA_SNIPPET|([^|]+)|(%S+)")
 	if not title or not url then return nil end
-	-- Trim whitespace
 	title = title:match("^%s*(.-)%s*$")
 	url = url:match("^%s*(.-)%s*$")
 	return { title = title, url = url }
 end
 
--- Download Lua code from a URL
-local function downloadCode(url)
-	local success, response = pcall(function()
-		return HttpService:RequestAsync({
-			Url = url,
-			Method = "GET",
-		})
-	end)
-	if not success then return nil, "Request failed" end
-	if response.StatusCode ~= 200 then return nil, "HTTP " .. tostring(response.StatusCode) end
-	return response.Body, nil
+-- Download Lua code from a URL with retry and validation
+local function downloadCode(url, retries)
+	retries = retries or 2
+	local lastErr = nil
+
+	for attempt = 1, retries + 1 do
+		local success, response = pcall(function()
+			return HttpService:RequestAsync({
+				Url = url,
+				Method = "GET",
+			})
+		end)
+
+		if not success then
+			lastErr = "Request failed"
+			if attempt <= retries then task.wait(1) end
+		else
+			local code = response.StatusCode
+			if code == 200 then
+				local body = response.Body
+				if not body or body == "" then
+					return nil, "Empty response body"
+				end
+				if #body < 10 then
+					return nil, "Response too short (" .. #body .. " chars) -- likely an error page"
+				end
+				return body, nil
+			elseif code == 404 then
+				return nil, "File not found at URL (404)"
+			elseif code == 403 then
+				return nil, "Access denied (403) -- is the repo public?"
+			elseif code >= 429 then
+				lastErr = "Rate limited (" .. code .. ")"
+				if attempt <= retries then task.wait(5) end
+			else
+				lastErr = "HTTP " .. tostring(code)
+				if attempt <= retries then task.wait(1) end
+			end
+		end
+	end
+
+	return nil, lastErr or "Download failed after " .. (retries + 1) .. " attempts"
 end
 
 local function insertSnippet(title, code)
@@ -338,6 +373,14 @@ local function pollDiscord()
 		return
 	end
 
+	-- Check if we are still in a rate limit cooldown
+	local now = os.clock()
+	if now < rateLimitResetAt then
+		local remaining = math.ceil(rateLimitResetAt - now)
+		statusLabel.Text = "Status: Rate limited, retry in " .. remaining .. "s"
+		return
+	end
+
 	local url = DISCORD_API .. "/channels/" .. SETTINGS.ChannelId .. "/messages?limit=10"
 	if lastSeenMessageId then
 		url = url .. "&after=" .. lastSeenMessageId
@@ -355,22 +398,47 @@ local function pollDiscord()
 	end)
 
 	if not success then
-		statusLabel.Text = "Status: Request failed"
+		consecutiveErrors = consecutiveErrors + 1
+		local backoff = math.min(POLL_INTERVAL * (2 ^ consecutiveErrors), MAX_BACKOFF)
+		statusLabel.Text = "Status: Request failed (backing off " .. math.floor(backoff) .. "s)"
 		return
 	end
 
-	if response.StatusCode == 401 then
-		statusLabel.Text = "Status: Invalid bot token"
-		stopPolling()
-		return
-	elseif response.StatusCode == 403 then
-		statusLabel.Text = "Status: No access to channel"
-		stopPolling()
-		return
-	elseif response.StatusCode ~= 200 then
-		statusLabel.Text = "Status: HTTP " .. tostring(response.StatusCode)
+	local code = response.StatusCode
+
+	-- Handle 429 Too Many Requests with retry-after
+	if code == 429 then
+		local body = decodeJsonSafe(response.Body)
+		local retryAfter = 5
+		if body and body.retry_after then
+			retryAfter = body.retry_after + 0.5
+		end
+		rateLimitResetAt = os.clock() + retryAfter
+		statusLabel.Text = "Status: Rate limited, retry in " .. math.ceil(retryAfter) .. "s"
 		return
 	end
+
+	-- Handle fatal auth errors
+	if code == 401 then
+		statusLabel.Text = "Status: Invalid bot token -- check settings"
+		stopPolling()
+		return
+	elseif code == 403 then
+		statusLabel.Text = "Status: No access to channel -- check permissions"
+		stopPolling()
+		return
+	elseif code ~= 200 then
+		consecutiveErrors = consecutiveErrors + 1
+		statusLabel.Text = "Status: Discord error " .. tostring(code) .. " (attempt " .. consecutiveErrors .. ")"
+		if consecutiveErrors >= 10 then
+			statusLabel.Text = "Status: Too many errors -- stopped. Check config."
+			stopPolling()
+		end
+		return
+	end
+
+	-- Success -- reset error counter
+	consecutiveErrors = 0
 
 	local messages = decodeJsonSafe(response.Body)
 	if not messages or #messages == 0 then return end
@@ -383,22 +451,28 @@ local function pollDiscord()
 				statusLabel.Text = "Status: Downloading " .. parsed.title .. "..."
 				local code, err = downloadCode(parsed.url)
 				if code then
-					local ok = pcall(insertSnippet, parsed.title, code)
-					if ok then
-						addSnippetToLog(parsed.title, parsed.url)
-						statusLabel.Text = "Status: Inserted " .. parsed.title
+					-- Validate it looks like Lua before inserting
+					local looksValid = code:match("function%s") or code:match("local%s") or code:match("return%s") or code:match("%-%-%[")
+					if not looksValid then
+						statusLabel.Text = "Status: Downloaded content does not look like Lua -- skipped"
 					else
-						statusLabel.Text = "Status: Insert failed"
+						local ok, insertErr = pcall(insertSnippet, parsed.title, code)
+						if ok then
+							addSnippetToLog(parsed.title, parsed.url)
+							statusLabel.Text = "Status: Inserted " .. parsed.title
+						else
+							statusLabel.Text = "Status: Insert failed: " .. tostring(insertErr):sub(1, 60)
+						end
 					end
 				else
-					statusLabel.Text = "Status: Download failed: " .. (err or "unknown")
+					statusLabel.Text = "Status: " .. (err or "Download failed")
 				end
 			end
 		end
 	end
 
 	lastSeenMessageId = messages[1].id
-	if statusLabel.Text:find("Inserted") or statusLabel.Text:find("failed") then
+	if statusLabel.Text:find("Inserted") or statusLabel.Text:find("failed") or statusLabel.Text:find("skipped") then
 		task.delay(3, function()
 			if isPolling then
 				statusLabel.Text = "Status: Monitoring..."
@@ -437,7 +511,11 @@ function stopPolling()
 end
 
 -- Init
-if SETTINGS.AutoRefresh and SETTINGS.BotToken ~= "" and SETTINGS.ChannelId ~= "" then
+local firstRun = getSetting("FirstRunDone", false)
+if not firstRun then
+	statusLabel.Text = "Status: Welcome! Enter token & channel, then Save"
+	setSetting("FirstRunDone", true)
+elseif SETTINGS.AutoRefresh and SETTINGS.BotToken ~= "" and SETTINGS.ChannelId ~= "" then
 	startPolling()
 else
 	statusLabel.Text = "Status: Configure settings to start"
