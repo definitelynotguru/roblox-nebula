@@ -5,6 +5,7 @@ local HttpService = game:GetService("HttpService")
 local POLL_INTERVAL = 5
 local DISCORD_API = "https://discord.com/api/v10"
 local lastSeenMessageId = nil
+local insertedSnippets = {} -- tracks script names already inserted to prevent duplicates
 local pollThread = nil
 local isPolling = false
 local rateLimitResetAt = 0
@@ -21,6 +22,31 @@ end
 
 local function setSetting(key, value)
 	plugin:SetSetting(pluginId .. "." .. key, value)
+end
+
+-- Load persisted state
+local function loadPersistedState()
+	lastSeenMessageId = getSetting("LastSeenMessageId", nil)
+	local snippetList = getSetting("InsertedSnippets", nil)
+	if snippetList then
+		for name in snippetList:gmatch("[^,]+") do
+			if name ~= "" then
+				insertedSnippets[name] = true
+			end
+		end
+	end
+end
+
+-- Save persisted state
+local function savePersistedState()
+	if lastSeenMessageId then
+		setSetting("LastSeenMessageId", lastSeenMessageId)
+	end
+	local names = {}
+	for name in pairs(insertedSnippets) do
+		table.insert(names, name)
+	end
+	setSetting("InsertedSnippets", table.concat(names, ","))
 end
 
 local SETTINGS = {
@@ -207,6 +233,7 @@ saveBtn.Parent = settingsFrame
 Instance.new("UICorner", saveBtn).CornerRadius = UDim.new(0, 4)
 
 saveBtn.MouseButton1Click:Connect(function()
+	local oldChannelId = SETTINGS.ChannelId
 	SETTINGS.BotToken = tokenBox.Text
 	SETTINGS.ChannelId = channelBox.Text
 	setSetting("BotToken", SETTINGS.BotToken)
@@ -218,7 +245,13 @@ saveBtn.MouseButton1Click:Connect(function()
 		end
 	end)
 	if SETTINGS.AutoRefresh and SETTINGS.BotToken ~= "" and SETTINGS.ChannelId ~= "" then
-		lastSeenMessageId = nil
+		-- Only reset tracking if the channel actually changed
+		if oldChannelId ~= SETTINGS.ChannelId then
+			lastSeenMessageId = nil
+			insertedSnippets = {}
+			setSetting("LastSeenMessageId", nil)
+			setSetting("InsertedSnippets", "")
+		end
 		consecutiveErrors = 0
 		rateLimitResetAt = 0
 		startPolling()
@@ -448,31 +481,39 @@ local function pollDiscord()
 		if msg.content and msg.content ~= "" then
 			local parsed = parseSnippetMessage(msg.content)
 			if parsed then
-				statusLabel.Text = "Status: Downloading " .. parsed.title .. "..."
-				local code, err = downloadCode(parsed.url)
-				if code then
-					-- Validate it looks like Lua before inserting
-					local looksValid = code:match("function%s") or code:match("local%s") or code:match("return%s") or code:match("%-%-%[")
-					if not looksValid then
-						statusLabel.Text = "Status: Downloaded content does not look like Lua -- skipped"
-					else
-						local ok, insertErr = pcall(insertSnippet, parsed.title, code)
-						if ok then
-							addSnippetToLog(parsed.title, parsed.url)
-							statusLabel.Text = "Status: Inserted " .. parsed.title
-						else
-							statusLabel.Text = "Status: Insert failed: " .. tostring(insertErr):sub(1, 60)
-						end
-					end
+				-- DEDUP: Skip if we already inserted a script with this title
+				if insertedSnippets[parsed.title] then
+					statusLabel.Text = "Status: Skipped " .. parsed.title .. " (already inserted)"
 				else
-					statusLabel.Text = "Status: " .. (err or "Download failed")
+					statusLabel.Text = "Status: Downloading " .. parsed.title .. "..."
+					local code, err = downloadCode(parsed.url)
+					if code then
+						-- Validate it looks like Lua before inserting
+						local looksValid = code:match("function%s") or code:match("local%s") or code:match("return%s") or code:match("%%-%%-")
+						if not looksValid then
+							statusLabel.Text = "Status: Downloaded content does not look like Lua -- skipped"
+						else
+							local ok, insertErr = pcall(insertSnippet, parsed.title, code)
+							if ok then
+								insertedSnippets[parsed.title] = true
+								savePersistedState()
+								addSnippetToLog(parsed.title, parsed.url)
+								statusLabel.Text = "Status: Inserted " .. parsed.title
+							else
+								statusLabel.Text = "Status: Insert failed: " .. tostring(insertErr):sub(1, 60)
+							end
+						end
+					else
+						statusLabel.Text = "Status: " .. (err or "Download failed")
+					end
 				end
 			end
 		end
 	end
 
 	lastSeenMessageId = messages[1].id
-	if statusLabel.Text:find("Inserted") or statusLabel.Text:find("failed") or statusLabel.Text:find("skipped") then
+	savePersistedState()
+	if statusLabel.Text:find("Inserted") or statusLabel.Text:find("failed") or statusLabel.Text:find("skipped") or statusLabel.Text:find("Skipped") then
 		task.delay(3, function()
 			if isPolling then
 				statusLabel.Text = "Status: Monitoring..."
@@ -510,7 +551,9 @@ function stopPolling()
 	statusLabel.Text = "Status: Paused"
 end
 
--- Init
+-- Init: load persisted state first
+loadPersistedState()
+
 local firstRun = getSetting("FirstRunDone", false)
 if not firstRun then
 	statusLabel.Text = "Status: Welcome! Enter token & channel, then Save"
