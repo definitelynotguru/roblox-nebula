@@ -1,6 +1,12 @@
 # Nebula AI for Roblox Studio
 
-Chat with Nebula here, get Luau scripts delivered straight into your Roblox Studio project.
+![GitHub License](https://img.shields.io/github/license/definitelynotguru/roblox-nebula?style=flat-square)
+![GitHub Stars](https://img.shields.io/github/stars/definitelynotguru/roblox-nebula?style=flat-square)
+![Roblox Studio](https://img.shields.io/badge/Roblox-Studio-blue?style=flat-square&logo=roblox)
+![Discord](https://img.shields.io/badge/Discord-Channel-5865F2?style=flat-square&logo=discord&logoColor=white)
+![Lua](https://img.shields.io/badge/Lua-Scripts-000080?style=flat-square&logo=lua&logoColor=white)
+
+Chat with Nebula, get Lua scripts delivered straight into your Roblox Studio project.
 
 ## How It Works
 
@@ -31,18 +37,17 @@ No tunnels, no backend servers, no localhost. Just a Discord bot watching a chan
 
 ### 3. Install the Plugin
 
-1. Copy `plugin/ServerScript.lua` into your Studio plugins folder:
+1. Copy `plugin/NebulaSnippetLoader.lua` into your Studio plugins folder:
    - Windows: `%localappdata%/Roblox/Plugins/`
    - Mac: `~/Documents/Roblox/Plugins/`
-2. Rename it to `NebulaAssistant.lua` (or any name you prefer)
+2. Open Roblox Studio -- you should see a **Nebula AI** button in the toolbar
 
 ### 4. Configure the Plugin
 
-1. Open Roblox Studio - you should see a **Nebula AI** button in the toolbar
-2. Click it to open the panel on the right
-3. Enter your **Bot Token** and **Channel ID**
-4. Click **Save Settings**
-5. If Auto-refresh is ON, it starts polling immediately
+1. Click the **Nebula AI** button to open the panel
+2. Enter your **Bot Token** and **Channel ID**
+3. Click **Save Settings**
+4. If Auto-refresh is ON, it starts polling immediately
 
 ### 5. Test It
 
@@ -54,7 +59,7 @@ I'll post the code to your Discord channel, and the plugin will:
 - Detect the snippet message
 - Parse the Lua code
 - Insert it as a new Script/LocalScript/ModuleScript in your workspace
-- Open it in the script editor
+- Open it in the script editor for you to review
 
 ## Usage
 
@@ -63,7 +68,7 @@ Just chat with me naturally. Examples:
 - "Create a leaderboard system"
 - "Write a door that opens on proximity"
 - "Make a sprint script with stamina"
-- "Build a inventory module with Add/Remove/Get methods"
+- "Build an inventory module with Add/Remove/Get methods"
 
 I'll generate the code, post it to Discord, and your plugin picks it up automatically.
 
@@ -85,56 +90,37 @@ Messages in the Discord channel use this structured format:
   "description": "Opens a door when a player gets close.",
   "script_type": "Script",
   "tags": ["door", "proximity"],
-  "code": "local door = script.Parent\nlocal ProximityPrompt = door:FindFirstChild(\"ProximityPrompt\")\n-- ..."
+  "code": "local door = script.Parent\n..."
 }
 ```
 
-You don't need to write this yourself - I handle it.
+You don't need to write this yourself -- I handle it.
+
+### Available Snippets
+
+Pre-built scripts you can grab instantly:
+
+| Snippet | Description |
+|---------|-------------|
+| Day Night Cycle | Automatic sky lighting with configurable time speed |
+| D20 Roll | Animated dice roller with nat 20/1 support |
+
+Ask me for a snippet by name and I'll send it to your channel.
 
 ## Architecture
 
 ```
-Nebula (cloud)
-    |
-    v  (Discord API - discord-send-message)
-Discord Channel (#roblox-studio)
-    |
-    v  (Discord API - poll every 5s)
-Roblox Studio Plugin (HttpService)
-    |
-    v
-Script inserted into Explorer
++-----------+     +-----------+     +-----------+
+| Chat UI   |---->| Discord   |---->| Plugin    |
+| (Nebula)  |     | Channel   |     | (Roblox)  |
++-----------+     +-----------+     +-----------+
+      ^                                   |
+      |          +-----------+            |
+      +----------| GitHub    |<-----------+
+                 | (storage) |
+                 +-----------+
 ```
-
-- **Plugin** runs entirely in Studio using HttpService
-- **Discord** is just the transport layer
-- **No backend to host**, no ngrok, no tunnels
-- Polls every 5 seconds for new snippet messages
-
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| Plugin says "Invalid bot token" | Reset the token in Discord Developer Portal, paste the new one |
-| "No access to channel" | Make sure the bot is invited to your server and has permission to read the channel |
-| Scripts not appearing | Check that Auto-refresh is ON and the channel ID is correct |
-| HttpService errors | Enable "Allow HTTP Requests" in Studio settings (Game Settings > Security) |
-| Nothing happens when I ask you | I need to post to your Discord channel - make sure you've given me the channel info |
-
-## Customization
-
-### Poll Interval
-
-The plugin polls every 5 seconds. To change it, edit `POLL_INTERVAL` at the top of the plugin file.
-
-### Multiple Scripts
-
-I can post multiple snippets in sequence. The plugin processes them in order.
-
-### Undo
-
-Use Ctrl+Z in Studio to undo an insertion.
 
 ## License
 
-MIT - do whatever you want with it.
+MIT
