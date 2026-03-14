@@ -257,32 +257,33 @@ local function decodeJsonSafe(str)
 	return nil
 end
 
-local function parseSnippetPayload(content)
-	local jsonStr = content:match("```json\n(.+)\n```")
-	if not jsonStr then
-		jsonStr = content:match("```json(.+)```")
-	end
-	if not jsonStr then return nil end
-
-	local data = decodeJsonSafe(jsonStr)
-	if not data then return nil end
-	if data.type ~= "roblox_snippet" then return nil end
-	if not data.code then return nil end
-
-	return data
+-- Parse NEBULA_SNIPPET|Title|URL format
+local function parseSnippetMessage(content)
+	local title, url = content:match("NEBULA_SNIPPET|([^|]+)|(%S+)")
+	if not title or not url then return nil end
+	-- Trim whitespace
+	title = title:match("^%s*(.-)%s*$")
+	url = url:match("^%s*(.-)%s*$")
+	return { title = title, url = url }
 end
 
-local function insertSnippet(snippet)
-	local scriptType = "ModuleScript"
-	if snippet.script_type == "LocalScript" then
-		scriptType = "LocalScript"
-	elseif snippet.script_type == "Script" then
-		scriptType = "Script"
-	end
+-- Download Lua code from a URL
+local function downloadCode(url)
+	local success, response = pcall(function()
+		return HttpService:RequestAsync({
+			Url = url,
+			Method = "GET",
+		})
+	end)
+	if not success then return nil, "Request failed" end
+	if response.StatusCode ~= 200 then return nil, "HTTP " .. tostring(response.StatusCode) end
+	return response.Body, nil
+end
 
-	local newScript = Instance.new(scriptType)
-	newScript.Name = snippet.title or "NebulaSnippet"
-	newScript.Source = snippet.code
+local function insertSnippet(title, code)
+	local newScript = Instance.new("Script")
+	newScript.Name = title or "NebulaSnippet"
+	newScript.Source = code
 
 	local sel = game:GetService("Selection"):Get()
 	if #sel > 0 then
@@ -297,12 +298,12 @@ local function insertSnippet(snippet)
 	return newScript
 end
 
-local function addSnippetToLog(snippet)
+local function addSnippetToLog(title, url)
 	snippetCount = snippetCount + 1
 	logLabel.Text = "Snippets received: " .. snippetCount
 
 	local entry = Instance.new("Frame")
-	entry.Size = UDim2.new(1, -8, 0, 48)
+	entry.Size = UDim2.new(1, -8, 0, 36)
 	entry.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
 	entry.LayoutOrder = snippetCount
 	entry.Parent = scrollFrame
@@ -312,35 +313,21 @@ local function addSnippetToLog(snippet)
 	local titleLbl = Instance.new("TextLabel")
 	titleLbl.Size = UDim2.new(1, 0, 0, 16)
 	titleLbl.BackgroundTransparency = 1
-	titleLbl.Text = (snippet.script_type or "?") .. ": " .. (snippet.title or "Untitled")
+	titleLbl.Text = title or "Untitled"
 	titleLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
 	titleLbl.TextSize = 11
 	titleLbl.TextXAlignment = Enum.TextXAlignment.Left
 	titleLbl.Parent = entry
 
-	local descLbl = Instance.new("TextLabel")
-	descLbl.Size = UDim2.new(1, 0, 0, 14)
-	descLbl.Position = UDim2.new(0, 0, 0, 18)
-	descLbl.BackgroundTransparency = 1
-	descLbl.Text = (snippet.description or ""):sub(1, 60) .. "..."
-	descLbl.TextColor3 = Color3.fromRGB(140, 140, 140)
-	descLbl.TextSize = 10
-	descLbl.TextXAlignment = Enum.TextXAlignment.Left
-	descLbl.Parent = entry
-
-	local tagsLbl = Instance.new("TextLabel")
-	tagsLbl.Size = UDim2.new(1, 0, 0, 12)
-	tagsLbl.Position = UDim2.new(0, 0, 0, 34)
-	tagsLbl.BackgroundTransparency = 1
-	if snippet.tags then
-		tagsLbl.Text = table.concat(snippet.tags, ", ")
-	else
-		tagsLbl.Text = ""
-	end
-	tagsLbl.TextColor3 = Color3.fromRGB(100, 140, 180)
-	tagsLbl.TextSize = 9
-	tagsLbl.TextXAlignment = Enum.TextXAlignment.Left
-	tagsLbl.Parent = entry
+	local urlLbl = Instance.new("TextLabel")
+	urlLbl.Size = UDim2.new(1, 0, 0, 14)
+	urlLbl.Position = UDim2.new(0, 0, 0, 18)
+	urlLbl.BackgroundTransparency = 1
+	urlLbl.Text = (url or ""):sub(1, 50) .. "..."
+	urlLbl.TextColor3 = Color3.fromRGB(100, 140, 180)
+	urlLbl.TextSize = 9
+	urlLbl.TextXAlignment = Enum.TextXAlignment.Left
+	urlLbl.Parent = entry
 
 	scrollFrame.CanvasSize = UDim2.new(0, 0, 0, snippetLayout.AbsoluteContentSize.Y + 8)
 	scrollFrame.CanvasPosition = Vector2.new(0, scrollFrame.AbsoluteCanvasSize.Y)
@@ -391,21 +378,35 @@ local function pollDiscord()
 	for i = #messages, 1, -1 do
 		local msg = messages[i]
 		if msg.content and msg.content ~= "" then
-			local snippet = parseSnippetPayload(msg.content)
-			if snippet then
-				local ok = pcall(insertSnippet, snippet)
-				if ok then
-					addSnippetToLog(snippet)
-					statusLabel.Text = "Status: Inserted " .. (snippet.title or "snippet")
+			local parsed = parseSnippetMessage(msg.content)
+			if parsed then
+				statusLabel.Text = "Status: Downloading " .. parsed.title .. "..."
+				local code, err = downloadCode(parsed.url)
+				if code then
+					local ok = pcall(insertSnippet, parsed.title, code)
+					if ok then
+						addSnippetToLog(parsed.title, parsed.url)
+						statusLabel.Text = "Status: Inserted " .. parsed.title
+					else
+						statusLabel.Text = "Status: Insert failed"
+					end
 				else
-					statusLabel.Text = "Status: Insert failed"
+					statusLabel.Text = "Status: Download failed: " .. (err or "unknown")
 				end
 			end
 		end
 	end
 
 	lastSeenMessageId = messages[1].id
-	statusLabel.Text = "Status: Monitoring..."
+	if statusLabel.Text:find("Inserted") or statusLabel.Text:find("failed") then
+		task.delay(3, function()
+			if isPolling then
+				statusLabel.Text = "Status: Monitoring..."
+			end
+		end)
+	else
+		statusLabel.Text = "Status: Monitoring..."
+	end
 end
 
 function startPolling()
@@ -430,7 +431,7 @@ function stopPolling()
 	isPolling = false
 	if pollThread then
 		task.cancel(pollThread)
-	pollThread = nil
+		pollThread = nil
 	end
 	statusLabel.Text = "Status: Paused"
 end
