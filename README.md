@@ -1,175 +1,140 @@
 # Nebula AI for Roblox Studio
 
-An AI coding assistant plugin for Roblox Studio. Chat with an AI that understands your game's context and can insert Luau scripts directly into your project.
+Chat with Nebula here, get Luau scripts delivered straight into your Roblox Studio project.
 
-## What It Does
+## How It Works
 
-- Chat panel inside Roblox Studio
-- AI generates Luau scripts based on your requests
-- One-click script insertion into workspace
-- Context-aware: sends selected instance info, hierarchy, and script source as context
-- Optional API key for backend authentication
-
-## Quick Start
-
-### 1. Backend Setup
-
-```bash
-cd backend
-cp .env.example .env
-# Edit .env and add your OpenAI API key
-npm install
-npm start
+```
+You (in chat) -> Nebula generates code -> Posts to Discord -> Plugin picks it up -> Inserts into Studio
 ```
 
-Server runs on `http://localhost:3000` by default.
+No tunnels, no backend servers, no localhost. Just a Discord bot watching a channel.
 
-### 2. Expose with a Tunnel
+## Setup (5 minutes)
 
-Roblox `HttpService` cannot reach `localhost` directly. Use a tunnel:
+### 1. Create a Discord Bot
 
-```bash
-# Pick one:
-npx localtunnel --port 3000
-# or
-ngrok http 3000
-# or
-cloudflared tunnel --url http://localhost:3000
-```
+1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
+2. Click **New Application**, name it something like "Nebula Studio"
+3. Go to the **Bot** tab, click **Reset Token**, copy the token (you only see it once!)
+4. Under **Bot** > **Privileged Gateway Intents**, enable:
+   - Message Content Intent
+5. Go to **OAuth2** > **URL Generator**:
+   - Scopes: `bot`
+   - Bot Permissions: `Send Messages`, `Read Message History`
+6. Copy the generated URL, open it, invite the bot to your server
 
-Copy the public HTTPS URL it gives you (e.g., `https://abc.loca.lt`).
+### 2. Create a Discord Channel
+
+1. In your Discord server, create a text channel called `#roblox-studio`
+2. Right-click the channel > **Copy Channel ID** (enable Developer Mode in Discord settings if needed)
 
 ### 3. Install the Plugin
 
-**Option A: Manual install**
-1. Open Roblox Studio
-2. Go to Plugins tab > Plugins Folder (or find your local plugins directory)
-3. Create a folder called `NebulaAI`
-4. Copy `plugin/ServerScript.lua` into it as `main.lua`
-5. Restart Studio
+1. Copy `plugin/ServerScript.lua` into your Studio plugins folder:
+   - Windows: `%localappdata%/Roblox/Plugins/`
+   - Mac: `~/Documents/Roblox/Plugins/`
+2. Rename it to `NebulaAssistant.lua` (or any name you prefer)
 
-**Option B: From .rbxmx file** (if you package it)
-1. Drag the .rbxmx file into Studio
-2. It installs automatically
+### 4. Configure the Plugin
 
-### 4. Configure
+1. Open Roblox Studio - you should see a **Nebula AI** button in the toolbar
+2. Click it to open the panel on the right
+3. Enter your **Bot Token** and **Channel ID**
+4. Click **Save Settings**
+5. If Auto-refresh is ON, it starts polling immediately
 
-1. In Studio, go to Plugins tab > click "Nebula AI" button (toolbar)
-2. The chat panel docks on the right side
-3. Click the Settings gear icon
-4. Enter your tunnel URL (e.g., `https://abc.loca.lt`)
-5. If you set `PLUGIN_API_KEY` in `.env`, enter that too
+### 5. Test It
 
-### 5. Use It
+Tell me something like:
 
-1. Select an object in the Explorer or Viewport
-2. Type a request like "Make this part spin" or "Create a leaderboard"
-3. Click Send or press Enter
-4. When the AI returns a script, click "Insert Script" to add it to your workspace
+> "Make a script that tweens a part upward when touched"
 
-## Configuration
+I'll post the code to your Discord channel, and the plugin will:
+- Detect the snippet message
+- Parse the Lua code
+- Insert it as a new Script/LocalScript/ModuleScript in your workspace
+- Open it in the script editor
 
-### Environment Variables (.env)
+## Usage
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `OPENAI_API_KEY` | Yes | - | Your OpenAI API key |
-| `PORT` | No | 3000 | Server port |
-| `PLUGIN_API_KEY` | No | - | Shared secret for plugin auth |
-| `MODEL` | No | gpt-4o-mini | OpenAI model to use |
+Just chat with me naturally. Examples:
 
-### Roblox Studio Settings
+- "Create a leaderboard system"
+- "Write a door that opens on proximity"
+- "Make a sprint script with stamina"
+- "Build a inventory module with Add/Remove/Get methods"
 
-In Game Settings > Security:
-- Check "Allow HTTP Requests"
-- Add your tunnel URL to the allowed domains list
+I'll generate the code, post it to Discord, and your plugin picks it up automatically.
 
-## API
+### Where Scripts Get Inserted
 
-### `POST /api/chat`
+- If you have something selected in Explorer, the script goes there
+- Otherwise, it goes into `Workspace`
+- The script is automatically opened in the editor for you to review
 
-**Headers:**
-- `Content-Type: application/json`
-- `Authorization: Bearer <PLUGIN_API_KEY>` (if configured)
+### Snippet Format
 
-**Body:**
+Messages in the Discord channel use this structured format:
+
 ```json
 {
-  "message": "Make this part spin",
-  "context": {
-    "selected": {
-      "Name": "Part",
-      "ClassName": "Part",
-      "Position": "0, 5, 0"
-    },
-    "hierarchy": [
-      {"Name": "Workspace", "Children": ["Part", "SpawnLocation"]}
-    ]
-  },
-  "history": [
-    {"role": "user", "content": "previous message"},
-    {"role": "assistant", "content": "previous reply"}
-  ]
+  "type": "roblox_snippet",
+  "version": "1",
+  "title": "Door Proximity Script",
+  "description": "Opens a door when a player gets close.",
+  "script_type": "Script",
+  "tags": ["door", "proximity"],
+  "code": "local door = script.Parent\nlocal ProximityPrompt = door:FindFirstChild(\"ProximityPrompt\")\n-- ..."
 }
 ```
 
-**Response:**
-```json
-{
-  "reply": "Here is a script...",
-  "script": "local part = script.Parent\nwhile true do\n  part.Rotation += Vector3.new(0, 1, 0)\n  task.wait()\nend",
-  "model": "gpt-4o-mini"
-}
-```
-
-### `GET /api/health`
-
-Returns server status. Useful for testing connectivity from the plugin.
+You don't need to write this yourself - I handle it.
 
 ## Architecture
 
 ```
-Roblox Studio Plugin (Luau UI)
-        │
-        ▼  HTTPS (tunnel)
-Local Backend (localhost:3000)
-        │
-        ▼  HTTPS
-OpenAI API
+Nebula (cloud)
+    |
+    v  (Discord API - discord-send-message)
+Discord Channel (#roblox-studio)
+    |
+    v  (Discord API - poll every 5s)
+Roblox Studio Plugin (HttpService)
+    |
+    v
+Script inserted into Explorer
 ```
 
-The backend extracts Lua code blocks from AI responses and returns them separately in the `script` field, making it easy for the plugin to insert them directly.
+- **Plugin** runs entirely in Studio using HttpService
+- **Discord** is just the transport layer
+- **No backend to host**, no ngrok, no tunnels
+- Polls every 5 seconds for new snippet messages
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| "HTTP requests not enabled" | Enable in Game Settings > Security |
-| "Connection refused" | Make sure backend is running and tunnel is active |
-| "URL not whitelisted" | Add your tunnel URL to the allowed domains list |
-| Plugin button not showing | Restart Studio, check Output window for errors |
-| AI returns no script | Try being more specific: "Write a Luau script that..." |
-| Tunnel URL changes | Update it in plugin settings (click gear icon) |
+| Plugin says "Invalid bot token" | Reset the token in Discord Developer Portal, paste the new one |
+| "No access to channel" | Make sure the bot is invited to your server and has permission to read the channel |
+| Scripts not appearing | Check that Auto-refresh is ON and the channel ID is correct |
+| HttpService errors | Enable "Allow HTTP Requests" in Studio settings (Game Settings > Security) |
+| Nothing happens when I ask you | I need to post to your Discord channel - make sure you've given me the channel info |
 
 ## Customization
 
-### Change the AI Model
+### Poll Interval
 
-Edit `backend/server.js` or set the `MODEL` env var:
-```
-MODEL=gpt-4o          # Better quality, higher cost
-MODEL=gpt-4o-mini     # Good balance (default)
-MODEL=gpt-3.5-turbo   # Cheapest
-```
+The plugin polls every 5 seconds. To change it, edit `POLL_INTERVAL` at the top of the plugin file.
 
-### Add System Prompts
+### Multiple Scripts
 
-Edit the `SYSTEM_PROMPT` in `backend/server.js` to customize the AI's personality, expertise, or coding style.
+I can post multiple snippets in sequence. The plugin processes them in order.
 
-### Styling
+### Undo
 
-Edit the `THEME` table in the plugin Lua file to change colors.
+Use Ctrl+Z in Studio to undo an insertion.
 
 ## License
 
-MIT
+MIT - do whatever you want with it.
