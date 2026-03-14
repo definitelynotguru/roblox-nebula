@@ -1,698 +1,475 @@
---[[
-    Nebula AI Assistant for Roblox Studio
-    Plugin script - place this in a folder named NebulaAI in your Studio plugins directory
-]]
+--[=[
+    Nebula Roblox Studio Plugin
+    Monitors a Discord channel for code snippets and auto-inserts them.
 
-local Selection = game:GetService("Selection")
-local ChangeHistoryService = game:GetService("ChangeHistoryService")
+    Setup:
+    1. Open plugin settings in Studio (Plugins > Nebula Settings)
+    2. Enter your Discord Bot Token
+    3. Enter the Channel ID to monitor
+    4. Enable auto-refresh
+--]=]
+
 local HttpService = game:GetService("HttpService")
 
-local plugin = plugin or getfenv().plugin
+-- ===== Plugin State =====
+local POLL_INTERVAL = 5 -- seconds
+local DISCORD_API = "https://discord.com/api/v10"
+local lastSeenMessageId = nil
+local pollThread = nil
+local isPolling = false
 
------------------------------------------------------
--- Settings
------------------------------------------------------
-local SETTING_API_URL = "NebulaAI_ApiUrl"
-local SETTING_API_KEY = "NebulaAI_ApiKey"
+-- ===== Settings (persisted) =====
+local pluginId = "NebulaRobloxAssistant"
 
-local function getApiUrl()
-    return plugin:GetSetting(SETTING_API_URL) or ""
+local function getSetting(key, default)
+    return plugin:GetSetting(pluginId .. "." .. key) or default
 end
 
-local function setApiUrl(url)
-    plugin:SetSetting(SETTING_API_URL, url)
+local function setSetting(key, value)
+    plugin:SetSetting(pluginId .. "." .. key, value)
 end
 
-local function getApiKey()
-    return plugin:GetSetting(SETTING_API_KEY) or ""
-end
-
-local function setApiKey(key)
-    plugin:SetSetting(SETTING_API_KEY, key)
-end
-
------------------------------------------------------
--- Theme
------------------------------------------------------
-local THEME = {
-    Background = Color3.fromRGB(30, 30, 30),
-    Surface = Color3.fromRGB(40, 40, 40),
-    InputBg = Color3.fromRGB(50, 50, 50),
-    Text = Color3.fromRGB(220, 220, 220),
-    TextDim = Color3.fromRGB(150, 150, 150),
-    Accent = Color3.fromRGB(0, 162, 255),
-    AccentHover = Color3.fromRGB(30, 180, 255),
-    Success = Color3.fromRGB(0, 200, 100),
-    Error = Color3.fromRGB(255, 80, 80),
-    UserBubble = Color3.fromRGB(0, 100, 180),
-    AiBubble = Color3.fromRGB(50, 50, 55),
-    Border = Color3.fromRGB(60, 60, 60),
+local SETTINGS = {
+    BotToken = getSetting("BotToken", ""),
+    ChannelId = getSetting("ChannelId", ""),
+    AutoRefresh = getSetting("AutoRefresh", true),
 }
 
------------------------------------------------------
--- Plugin UI Setup
------------------------------------------------------
+-- ===== UI Setup =====
 local toolbar = plugin:CreateToolbar("Nebula AI")
 local toggleButton = toolbar:CreateButton(
-    "NebulaChat",
-    "Open AI Assistant",
-    "rbxassetid://10734950109"
+    "Open Nebula",
+    "Toggle the Nebula snippet panel",
+    "rbxassetid://4458901886"
 )
 
 local widgetInfo = DockWidgetPluginGuiInfo.new(
     Enum.InitialDockState.Right,
-    false,  -- initial enabled
-    false,  -- override enabled
-    380,    -- default width
-    500,    -- default height
-    250,    -- min width
-    300     -- min height
+    false,
+    false,
+    320,
+    400,
+    260,
+    200
 )
 
-local widget = plugin:CreateDockWidgetPluginGui("NebulaAI_Chat", widgetInfo)
+local widget = plugin:CreateDockWidgetPluginGui("NebulaWidget", widgetInfo)
 widget.Title = "Nebula AI"
 
 toggleButton.Click:Connect(function()
     widget.Enabled = not widget.Enabled
 end)
 
------------------------------------------------------
--- Helper: Create UI elements
------------------------------------------------------
-local function createInstance(className, props, children)
-    local inst = Instance.new(className)
-    for key, value in pairs(props or {}) do
-        if key ~= "Parent" then
-            pcall(function()
-                inst[key] = value
-            end)
-        end
+-- ===== Main Frame =====
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(1, 0, 1, 0)
+mainFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+mainFrame.BorderSizePixel = 0
+mainFrame.Parent = widget
+
+local uiListLayout = Instance.new("UIListLayout")
+uiListLayout.Padding = UDim.new(0, 8)
+uiListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+uiListLayout.Parent = mainFrame
+
+local padding = Instance.new("UIPadding")
+padding.PaddingTop = UDim.new(0, 8)
+padding.PaddingBottom = UDim.new(0, 8)
+padding.PaddingLeft = UDim.new(0, 8)
+padding.PaddingRight = UDim.new(0, 8)
+padding.Parent = mainFrame
+
+-- ===== Status Label =====
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, 0, 0, 20)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "Status: Not connected"
+statusLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+statusLabel.TextSize = 12
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.LayoutOrder = 1
+statusLabel.Parent = mainFrame
+
+-- ===== Snippet Log =====
+local logLabel = Instance.new("TextLabel")
+logLabel.Size = UDim2.new(1, 0, 0, 16)
+logLabel.BackgroundTransparency = 1
+logLabel.Text = "Snippets received: 0"
+logLabel.TextColor3 = Color3.fromRGB(140, 140, 140)
+logLabel.TextSize = 11
+logLabel.TextXAlignment = Enum.TextXAlignment.Left
+logLabel.LayoutOrder = 2
+logLabel.Parent = mainFrame
+
+-- ===== Settings Section =====
+local settingsFrame = Instance.new("Frame")
+settingsFrame.Size = UDim2.new(1, 0, 0, 120)
+settingsFrame.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+settingsFrame.LayoutOrder = 3
+settingsFrame.Parent = mainFrame
+
+Instance.new("UICorner", settingsFrame).CornerRadius = UDim.new(0, 4)
+
+local settingsPadding = Instance.new("UIPadding")
+settingsPadding.PaddingTop = UDim.new(0, 6)
+settingsPadding.PaddingBottom = UDim.new(0, 6)
+settingsPadding.PaddingLeft = UDim.new(0, 8)
+settingsPadding.PaddingRight = UDim.new(0, 8)
+settingsPadding.Parent = settingsFrame
+
+local settingsLayout = Instance.new("UIListLayout")
+settingsLayout.Padding = UDim.new(0, 4)
+settingsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+settingsLayout.Parent = settingsFrame
+
+-- Helper to create settings rows
+local function createSettingRow(label, default, order, isPassword)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, 24)
+    row.BackgroundTransparency = 1
+    row.LayoutOrder = order
+    row.Parent = settingsFrame
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(0, 70, 1, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = label
+    lbl.TextColor3 = Color3.fromRGB(180, 180, 180)
+    lbl.TextSize = 11
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = row
+
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(1, -74, 1, 0)
+    box.Position = UDim2.new(0, 74, 0, 0)
+    box.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+    box.TextColor3 = Color3.fromRGB(220, 220, 220)
+    box.TextSize = 11
+    box.Text = default
+    box.PlaceholderText = label .. "..."
+    box.ClearTextOnFocus = false
+    box.Parent = row
+
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 3)
+
+    if isPassword then
+        box.TextTransparency = 0.3
     end
-    for _, child in ipairs(children or {}) do
-        child.Parent = inst
-    end
-    if props and props.Parent then
-        inst.Parent = props.Parent
-    end
-    return inst
+
+    return box
 end
 
------------------------------------------------------
--- Main Frame
------------------------------------------------------
-local mainFrame = createInstance("Frame", {
-    Parent = widget,
-    BackgroundColor3 = THEME.Background,
-    BorderSizePixel = 0,
-    Size = UDim2.new(1, 0, 1, 0),
-})
+local tokenBox = createSettingRow("Bot Token", SETTINGS.BotToken, 1, true)
+local channelBox = createSettingRow("Channel ID", SETTINGS.ChannelId, 2, false)
 
------------------------------------------------------
--- Header
------------------------------------------------------
-local header = createInstance("Frame", {
-    Parent = mainFrame,
-    BackgroundColor3 = THEME.Surface,
-    BorderSizePixel = 0,
-    Size = UDim2.new(1, 0, 0, 40),
-})
+-- Auto-refresh toggle row
+local toggleRow = Instance.new("Frame")
+toggleRow.Size = UDim2.new(1, 0, 0, 22)
+toggleRow.BackgroundTransparency = 1
+toggleRow.LayoutOrder = 4
+toggleRow.Parent = settingsFrame
 
-local headerTitle = createInstance("TextLabel", {
-    Parent = header,
-    BackgroundTransparency = 1,
-    Position = UDim2.new(0, 12, 0, 0),
-    Size = UDim2.new(1, -60, 1, 0),
-    Font = Enum.Font.GothamBold,
-    Text = "Nebula AI",
-    TextColor3 = THEME.Accent,
-    TextSize = 16,
-    TextXAlignment = Enum.TextXAlignment.Left,
-})
+local toggleLabel = Instance.new("TextLabel")
+toggleLabel.Size = UDim2.new(0, 80, 1, 0)
+toggleLabel.BackgroundTransparency = 1
+toggleLabel.Text = "Auto-refresh"
+toggleLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+toggleLabel.TextSize = 11
+toggleLabel.TextXAlignment = Enum.TextXAlignment.Left
+toggleLabel.Parent = toggleRow
 
-local settingsButton = createInstance("TextButton", {
-    Parent = header,
-    BackgroundTransparency = 1,
-    Position = UDim2.new(1, -36, 0, 4),
-    Size = UDim2.new(0, 32, 0, 32),
-    Font = Enum.Font.GothamBold,
-    Text = "[S]",
-    TextColor3 = THEME.TextDim,
-    TextSize = 16,
-})
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size = UDim2.new(0, 40, 0, 20)
+toggleBtn.Position = UDim2.new(0, 80, 0, 1)
+toggleBtn.BackgroundColor3 = SETTINGS.AutoRefresh and Color3.fromRGB(80, 160, 80) or Color3.fromRGB(100, 100, 100)
+toggleBtn.Text = SETTINGS.AutoRefresh and "ON" or "OFF"
+toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleBtn.TextSize = 11
+toggleBtn.Parent = toggleRow
 
-local divider = createInstance("Frame", {
-    Parent = header,
-    BackgroundColor3 = THEME.Border,
-    BorderSizePixel = 0,
-    Position = UDim2.new(0, 0, 1, -1),
-    Size = UDim2.new(1, 0, 0, 1),
-})
+Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 3)
 
------------------------------------------------------
--- Chat Container (scrollable)
------------------------------------------------------
-local chatScroll = createInstance("ScrollingFrame", {
-    Parent = mainFrame,
-    BackgroundTransparency = 1,
-    Position = UDim2.new(0, 0, 0, 40),
-    Size = UDim2.new(1, 0, 1, -110),
-    CanvasSize = UDim2.new(0, 0, 0, 0),
-    AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    ScrollBarThickness = 6,
-    ScrollBarImageColor3 = THEME.Border,
-    BorderSizePixel = 0,
-    ClipsDescendants = true,
-})
-
-local chatLayout = createInstance("UIListLayout", {
-    Parent = chatScroll,
-    SortOrder = Enum.SortOrder.LayoutOrder,
-    Padding = UDim.new(0, 8),
-})
-
-local chatPadding = createInstance("UIPadding", {
-    Parent = chatScroll,
-    PaddingLeft = UDim.new(0, 10),
-    PaddingRight = UDim.new(0, 10),
-    PaddingTop = UDim.new(0, 10),
-    PaddingBottom = UDim.new(0, 10),
-})
-
------------------------------------------------------
--- Input Area
------------------------------------------------------
-local inputArea = createInstance("Frame", {
-    Parent = mainFrame,
-    BackgroundColor3 = THEME.Surface,
-    BorderSizePixel = 0,
-    Position = UDim2.new(0, 0, 1, -70),
-    Size = UDim2.new(1, 0, 0, 70),
-})
-
-local inputDivider = createInstance("Frame", {
-    Parent = inputArea,
-    BackgroundColor3 = THEME.Border,
-    BorderSizePixel = 0,
-    Size = UDim2.new(1, 0, 0, 1),
-})
-
-local inputBox = createInstance("TextBox", {
-    Parent = inputArea,
-    BackgroundColor3 = THEME.InputBg,
-    BorderSizePixel = 0,
-    Position = UDim2.new(0, 10, 0, 8),
-    Size = UDim2.new(1, -80, 0, 36),
-    Font = Enum.Font.Gotham,
-    PlaceholderText = "Ask about your game...",
-    PlaceholderColor3 = THEME.TextDim,
-    Text = "",
-    TextColor3 = THEME.Text,
-    TextSize = 14,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    ClearTextOnFocus = false,
-    MultiLine = false,
-})
-
-local inputCorner = createInstance("UICorner", {
-    Parent = inputBox,
-    CornerRadius = UDim.new(0, 6),
-})
-
-local sendButton = createInstance("TextButton", {
-    Parent = inputArea,
-    BackgroundColor3 = THEME.Accent,
-    BorderSizePixel = 0,
-    Position = UDim2.new(1, -60, 0, 8),
-    Size = UDim2.new(0, 50, 0, 36),
-    Font = Enum.Font.GothamBold,
-    Text = "Send",
-    TextColor3 = Color3.fromRGB(255, 255, 255),
-    TextSize = 14,
-})
-
-local sendCorner = createInstance("UICorner", {
-    Parent = sendButton,
-    CornerRadius = UDim.new(0, 6),
-})
-
-local statusLabel = createInstance("TextLabel", {
-    Parent = inputArea,
-    BackgroundTransparency = 1,
-    Position = UDim2.new(0, 10, 0, 48),
-    Size = UDim2.new(1, -20, 0, 16),
-    Font = Enum.Font.Gotham,
-    Text = "",
-    TextColor3 = THEME.TextDim,
-    TextSize = 11,
-    TextXAlignment = Enum.TextXAlignment.Left,
-})
-
------------------------------------------------------
--- Settings Panel
------------------------------------------------------
-local settingsPanel = createInstance("Frame", {
-    Parent = mainFrame,
-    BackgroundColor3 = THEME.Background,
-    BorderSizePixel = 0,
-    Size = UDim2.new(1, 0, 1, 0),
-    Visible = false,
-    ZIndex = 10,
-})
-
-local settingsHeader = createInstance("TextLabel", {
-    Parent = settingsPanel,
-    BackgroundTransparency = 1,
-    Position = UDim2.new(0, 12, 0, 12),
-    Size = UDim2.new(1, -24, 0, 24),
-    Font = Enum.Font.GothamBold,
-    Text = "Settings",
-    TextColor3 = THEME.Accent,
-    TextSize = 18,
-    TextXAlignment = Enum.TextXAlignment.Left,
-})
-
-local apiLabel = createInstance("TextLabel", {
-    Parent = settingsPanel,
-    BackgroundTransparency = 1,
-    Position = UDim2.new(0, 12, 0, 50),
-    Size = UDim2.new(1, -24, 0, 16),
-    Font = Enum.Font.Gotham,
-    Text = "Backend URL",
-    TextColor3 = THEME.TextDim,
-    TextSize = 12,
-    TextXAlignment = Enum.TextXAlignment.Left,
-})
-
-local apiInput = createInstance("TextBox", {
-    Parent = settingsPanel,
-    BackgroundColor3 = THEME.InputBg,
-    BorderSizePixel = 0,
-    Position = UDim2.new(0, 12, 0, 70),
-    Size = UDim2.new(1, -24, 0, 32),
-    Font = Enum.Font.Gotham,
-    PlaceholderText = "https://your-tunnel-url.com",
-    PlaceholderColor3 = THEME.TextDim,
-    Text = getApiUrl(),
-    TextColor3 = THEME.Text,
-    TextSize = 13,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    ClearTextOnFocus = false,
-})
-
-local apiInputCorner = createInstance("UICorner", {
-    Parent = apiInput,
-    CornerRadius = UDim.new(0, 6),
-})
-
-local keyLabel = createInstance("TextLabel", {
-    Parent = settingsPanel,
-    BackgroundTransparency = 1,
-    Position = UDim2.new(0, 12, 0, 112),
-    Size = UDim2.new(1, -24, 0, 16),
-    Font = Enum.Font.Gotham,
-    Text = "API Key (optional)",
-    TextColor3 = THEME.TextDim,
-    TextSize = 12,
-    TextXAlignment = Enum.TextXAlignment.Left,
-})
-
-local keyInput = createInstance("TextBox", {
-    Parent = settingsPanel,
-    BackgroundColor3 = THEME.InputBg,
-    BorderSizePixel = 0,
-    Position = UDim2.new(0, 12, 0, 132),
-    Size = UDim2.new(1, -24, 0, 32),
-    Font = Enum.Font.Gotham,
-    PlaceholderText = "Leave blank if not configured",
-    PlaceholderColor3 = THEME.TextDim,
-    Text = getApiKey(),
-    TextColor3 = THEME.Text,
-    TextSize = 13,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    ClearTextOnFocus = false,
-})
-
-local keyInputCorner = createInstance("UICorner", {
-    Parent = keyInput,
-    CornerRadius = UDim.new(0, 6),
-})
-
-local saveSettingsBtn = createInstance("TextButton", {
-    Parent = settingsPanel,
-    BackgroundColor3 = THEME.Success,
-    BorderSizePixel = 0,
-    Position = UDim2.new(0, 12, 0, 180),
-    Size = UDim2.new(1, -24, 0, 36),
-    Font = Enum.Font.GothamBold,
-    Text = "Save & Close",
-    TextColor3 = Color3.fromRGB(255, 255, 255),
-    TextSize = 14,
-})
-
-local saveCorner = createInstance("UICorner", {
-    Parent = saveSettingsBtn,
-    CornerRadius = UDim.new(0, 6),
-})
-
------------------------------------------------------
--- State
------------------------------------------------------
-local conversationHistory = {}
-local isWaiting = false
-local messageCount = 0
-
------------------------------------------------------
--- Get selected instance context
------------------------------------------------------
-local function getSelectionContext()
-    local selected = Selection:Get()
-    if #selected == 0 then return nil end
-
-    local inst = selected[1]
-    local context = {
-        selected = {
-            Name = inst.Name,
-            ClassName = inst.ClassName,
-            Parent = inst.Parent and inst.Parent:GetFullName() or nil,
-        },
-        hierarchy = {},
-    }
-
-    -- Add position/size for BaseParts
-    if inst:IsA("BasePart") then
-        local p = inst.Position
-        context.selected.Position = string.format("%.1f, %.1f, %.1f", p.X, p.Y, p.Z)
-        local s = inst.Size
-        context.selected.Size = string.format("%.1f, %.1f, %.1f", s.X, s.Y, s.Z)
+toggleBtn.MouseButton1Click:Connect(function()
+    SETTINGS.AutoRefresh = not SETTINGS.AutoRefresh
+    toggleBtn.Text = SETTINGS.AutoRefresh and "ON" or "OFF"
+    toggleBtn.BackgroundColor3 = SETTINGS.AutoRefresh and Color3.fromRGB(80, 160, 80) or Color3.fromRGB(100, 100, 100)
+    setSetting("AutoRefresh", SETTINGS.AutoRefresh)
+    if SETTINGS.AutoRefresh then
+        startPolling()
+    else
+        stopPolling()
     end
+end)
 
-    -- If it's a Script or LocalScript, include the source
-    if inst:IsA("LuaSourceContainer") then
-        context.script = inst.Source
-    end
+-- Save button
+local saveBtn = Instance.new("TextButton")
+saveBtn.Size = UDim2.new(1, 0, 0, 26)
+saveBtn.BackgroundColor3 = Color3.fromRGB(60, 120, 180)
+saveBtn.Text = "Save Settings"
+saveBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+saveBtn.TextSize = 12
+saveBtn.LayoutOrder = 5
+saveBtn.Parent = settingsFrame
 
-    -- Top-level hierarchy of parent
-    local parent = inst.Parent
-    if parent then
-        for _, child in ipairs(parent:GetChildren()) do
-            if child ~= inst then
-                table.insert(context.hierarchy, {
-                    Name = child.Name,
-                    ClassName = child.ClassName,
-                })
-            end
+Instance.new("UICorner", saveBtn).CornerRadius = UDim.new(0, 4)
+
+saveBtn.MouseButton1Click:Connect(function()
+    SETTINGS.BotToken = tokenBox.Text
+    SETTINGS.ChannelId = channelBox.Text
+    setSetting("BotToken", SETTINGS.BotToken)
+    setSetting("ChannelId", SETTINGS.ChannelId)
+    statusLabel.Text = "Status: Settings saved"
+    task.delay(2, function()
+        if statusLabel.Text == "Status: Settings saved" then
+            statusLabel.Text = isPolling and "Status: Monitoring..." or "Status: Ready (start polling)"
         end
-    end
-
-    return context
-end
-
------------------------------------------------------
--- Add message bubble to chat
------------------------------------------------------
-local function addMessageBubble(role, text, script)
-    messageCount += 1
-
-    local isUser = role == "user"
-    local bubbleColor = isUser and THEME.UserBubble or THEME.AiBubble
-    local align = isUser and Enum.TextXAlignment.Right or Enum.TextXAlignment.Left
-
-    -- Container frame
-    local bubbleFrame = createInstance("Frame", {
-        Parent = chatScroll,
-        BackgroundColor3 = bubbleColor,
-        BorderSizePixel = 0,
-        AutomaticSize = Enum.AutomaticSize.Y,
-        Size = UDim2.new(0.85, 0, 0, 0),
-        LayoutOrder = messageCount,
-    })
-
-    local bubbleCorner = createInstance("UICorner", {
-        Parent = bubbleFrame,
-        CornerRadius = UDim.new(0, 8),
-    })
-
-    -- Label
-    local roleLabel = createInstance("TextLabel", {
-        Parent = bubbleFrame,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 10, 0, 6),
-        Size = UDim2.new(1, -20, 0, 14),
-        Font = Enum.Font.GothamBold,
-        Text = isUser and "You" or "Nebula",
-        TextColor3 = THEME.TextDim,
-        TextSize = 11,
-        TextXAlignment = align,
-        TextYAlignment = Enum.TextYAlignment.Top,
-    })
-
-    local textLabel = createInstance("TextLabel", {
-        Parent = bubbleFrame,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 10, 0, 22),
-        Size = UDim2.new(1, -20, 0, 0),
-        AutomaticSize = Enum.AutomaticSize.Y,
-        Font = Enum.Font.Gotham,
-        Text = text,
-        TextColor3 = THEME.Text,
-        TextSize = 13,
-        TextXAlignment = align,
-        TextYAlignment = Enum.TextYAlignment.Top,
-        TextWrapped = true,
-    })
-
-    -- Insert script button (only for AI messages with code)
-    if script and not isUser then
-        local scriptPreview = createInstance("TextLabel", {
-            Parent = bubbleFrame,
-            BackgroundColor3 = Color3.fromRGB(25, 25, 25),
-            BorderSizePixel = 0,
-            Position = UDim2.new(0, 8, 0, 0),
-            Size = UDim2.new(1, -16, 0, 0),
-            AutomaticSize = Enum.AutomaticSize.Y,
-            Font = Enum.Font.Code,
-            Text = string.sub(script, 1, 300) .. (string.len(script) > 300 and "..." or ""),
-            TextColor3 = Color3.fromRGB(180, 220, 180),
-            TextSize = 11,
-            TextXAlignment = Enum.TextXAlignment.Left,
-            TextYAlignment = Enum.TextYAlignment.Top,
-            TextWrapped = true,
-            Visible = false, -- shown after layout calculation
-        })
-
-        local previewCorner = createInstance("UICorner", {
-            Parent = scriptPreview,
-            CornerRadius = UDim.new(0, 4),
-        })
-
-        local previewPad = createInstance("UIPadding", {
-            Parent = scriptPreview,
-            PaddingLeft = UDim.new(0, 6),
-            PaddingRight = UDim.new(0, 6),
-            PaddingTop = UDim.new(0, 6),
-            PaddingBottom = UDim.new(0, 6),
-        })
-
-        local insertBtn = createInstance("TextButton", {
-            Parent = bubbleFrame,
-            BackgroundColor3 = THEME.Success,
-            BorderSizePixel = 0,
-            Position = UDim2.new(0, 8, 0, 0),
-            Size = UDim2.new(1, -16, 0, 32),
-            Font = Enum.Font.GothamBold,
-            Text = "Insert Script",
-            TextColor3 = Color3.fromRGB(255, 255, 255),
-            TextSize = 13,
-            LayoutOrder = 100,
-        })
-
-        local insertCorner = createInstance("UICorner", {
-            Parent = insertBtn,
-            CornerRadius = UDim.new(0, 6),
-        })
-
-        local savedScript = script
-
-        insertBtn.MouseButton1Click:Connect(function()
-            ChangeHistoryService:SetWaypoint("Nebula AI: Insert Script")
-
-            local selected = Selection:Get()
-            local target
-
-            if #selected > 0 and selected[1]:IsA("LuaSourceContainer") then
-                -- Replace source of selected script
-                target = selected[1]
-                target.Source = savedScript
-            else
-                -- Create new Script in Workspace or under selected instance
-                local newScript = Instance.new("Script")
-                newScript.Name = "NebulaScript"
-                newScript.Source = savedScript
-
-                if #selected > 0 then
-                    newScript.Parent = selected[1]
-                else
-                    newScript.Parent = workspace
-                end
-
-                target = newScript
-                Selection:Set({newScript})
-            end
-
-            ChangeHistoryService:SetWaypoint("Nebula AI: Inserted Script")
-            statusLabel.Text = "Script inserted!"
-            task.delay(3, function()
-                if statusLabel.Text == "Script inserted!" then
-                    statusLabel.Text = ""
-                end
-            end)
-        end)
-    end
-
-    -- Layout for bubble children
-    local bubbleLayout = createInstance("UIListLayout", {
-        Parent = bubbleFrame,
-        SortOrder = Enum.SortOrder.LayoutOrder,
-        Padding = UDim.new(0, 4),
-    })
-
-    local bubblePad = createInstance("UIPadding", {
-        Parent = bubbleFrame,
-        PaddingLeft = UDim.new(0, 4),
-        PaddingRight = UDim.new(0, 4),
-        PaddingTop = UDim.new(0, 4),
-        PaddingBottom = UDim.new(0, 8),
-    })
-
-    -- Auto-scroll to bottom
-    task.defer(function()
-        chatScroll.CanvasPosition = Vector2.new(0, chatScroll.AbsoluteCanvasSize.Y)
     end)
+    -- Restart polling with new settings
+    if SETTINGS.AutoRefresh and SETTINGS.BotToken ~= "" and SETTINGS.ChannelId ~= "" then
+        lastSeenMessageId = nil
+        startPolling()
+    end
+end)
+
+-- ===== Snippet History List =====
+local scrollFrame = Instance.new("ScrollingFrame")
+scrollFrame.Size = UDim2.new(1, 0, 1, -230)
+scrollFrame.Position = UDim2.new(0, 0, 0, 230)
+scrollFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+scrollFrame.BorderSizePixel = 0
+scrollFrame.ScrollBarThickness = 4
+scrollFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+scrollFrame.LayoutOrder = 6
+scrollFrame.Parent = mainFrame
+
+Instance.new("UICorner", scrollFrame).CornerRadius = UDim.new(0, 4)
+
+local snippetLayout = Instance.new("UIListLayout")
+snippetLayout.Padding = UDim.new(0, 4)
+snippetLayout.SortOrder = Enum.SortOrder.LayoutOrder
+snippetLayout.Parent = scrollFrame
+
+local snippetPadding = Instance.new("UIPadding")
+snippetPadding.PaddingTop = UDim.new(0, 4)
+snippetPadding.PaddingBottom = UDim.new(0, 4)
+snippetPadding.PaddingLeft = UDim.new(0, 4)
+snippetPadding.PaddingRight = UDim.new(0, 4)
+snippetPadding.Parent = scrollFrame
+
+local snippetCount = 0
+
+-- ===== Core Logic =====
+
+local function decodeJsonSafe(str)
+    local ok, result = pcall(function()
+        return HttpService:JSONDecode(str)
+    end)
+    if ok then return result end
+    return nil
 end
 
------------------------------------------------------
--- Send message to backend
------------------------------------------------------
-local function sendMessage()
-    local message = inputBox.Text
-    if message == "" or isWaiting then return end
+local function parseSnippetPayload(content)
+    -- Look for ```json ... ``` code blocks
+    local jsonStr = content:match("```json\n(.+)```")
+    if not jsonStr then
+        jsonStr = content:match("```json(.+)```")
+    end
+    if not jsonStr then return nil end
 
-    local apiUrl = getApiUrl()
-    if apiUrl == "" then
-        statusLabel.Text = "Set backend URL in settings first"
-        settingsPanel.Visible = true
+    local data = decodeJsonSafe(jsonStr)
+    if not data then return nil end
+    if data.type ~= "roblox_snippet" then return nil end
+    if not data.code then return nil end
+
+    return data
+end
+
+local function insertSnippet(snippet)
+    -- Determine script type
+    local scriptType = "ModuleScript"
+    if snippet.script_type == "LocalScript" then
+        scriptType = "LocalScript"
+    elseif snippet.script_type == "Script" then
+        scriptType = "Script"
+    end
+
+    -- Create the script instance
+    local newScript = Instance.new(scriptType)
+    newScript.Name = snippet.title or "NebulaSnippet"
+    newScript.Source = snippet.code
+
+    -- Insert into the selected object, or workspace as fallback
+    local parent = game:GetService("Selection"):Get()
+    if #parent > 0 then
+        newScript.Parent = parent[1]
+    else
+        newScript.Parent = workspace
+    end
+
+    -- Select the new script
+    game:GetService("Selection"):Set({newScript})
+
+    -- Open it in the script editor
+    plugin:OpenScript(newScript)
+
+    return newScript
+end
+
+local function addSnippetToLog(snippet, message)
+    snippetCount = snippetCount + 1
+    logLabel.Text = "Snippets received: " .. snippetCount
+
+    local entry = Instance.new("Frame")
+    entry.Size = UDim2.new(1, -8, 0, 48)
+    entry.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+    entry.LayoutOrder = snippetCount
+    entry.Parent = scrollFrame
+
+    Instance.new("UICorner", entry).CornerRadius = UDim.new(0, 3)
+
+    local entryPadding = Instance.new("UIPadding")
+    entryPadding.PaddingTop = UDim.new(0, 4)
+    entryPadding.PaddingBottom = UDim.new(0, 4)
+    entryPadding.PaddingLeft = UDim.new(0, 6)
+    entryPadding.PaddingRight = UDim.new(0, 6)
+    entry.Parent = entry
+
+    local titleLbl = Instance.new("TextLabel")
+    titleLbl.Size = UDim2.new(1, 0, 0, 16)
+    titleLbl.BackgroundTransparency = 1
+    titleLbl.Text = (snippet.script_type or "?") .. ": " .. (snippet.title or "Untitled")
+    titleLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+    titleLbl.TextSize = 11
+    titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+    titleLbl.Parent = entry
+
+    local descLbl = Instance.new("TextLabel")
+    descLbl.Size = UDim2.new(1, 0, 0, 14)
+    descLbl.Position = UDim2.new(0, 0, 0, 18)
+    descLbl.BackgroundTransparency = 1
+    descLbl.Text = (snippet.description or ""):sub(1, 60) .. "..."
+    descLbl.TextColor3 = Color3.fromRGB(140, 140, 140)
+    descLbl.TextSize = 10
+    descLbl.TextXAlignment = Enum.TextXAlignment.Left
+    descLbl.Parent = entry
+
+    local tagsLbl = Instance.new("TextLabel")
+    tagsLbl.Size = UDim2.new(1, 0, 0, 12)
+    tagsLbl.Position = UDim2.new(0, 0, 0, 34)
+    tagsLbl.BackgroundTransparency = 1
+    if snippet.tags then
+        tagsLbl.Text = table.concat(snippet.tags, ", ")
+    else
+        tagsLbl.Text = ""
+    end
+    tagsLbl.TextColor3 = Color3.fromRGB(100, 140, 180)
+    tagsLbl.TextSize = 9
+    tagsLbl.TextXAlignment = Enum.TextXAlignment.Left
+    tagsLbl.Parent = entry
+
+    -- Update scroll canvas
+    scrollFrame.CanvasSize = UDim2.new(0, 0, 0, snippetLayout.AbsoluteContentSize.Y + 8)
+    scrollFrame.CanvasPosition = Vector2.new(0, scrollFrame.AbsoluteCanvasSize.Y)
+end
+
+local function pollDiscord()
+    if SETTINGS.BotToken == "" or SETTINGS.ChannelId == "" then
         return
     end
 
-    isWaiting = true
-    inputBox.Text = ""
-    statusLabel.Text = "Thinking..."
-    sendButton.BackgroundColor3 = THEME.TextDim
-
-    -- Add user bubble
-    addMessageBubble("user", message, nil)
-
-    -- Build request
-    local requestBody = {
-        message = message,
-        context = getSelectionContext(),
-        history = conversationHistory,
-    }
-
-    local headers = {
-        ["Content-Type"] = "application/json",
-    }
-
-    local apiKey = getApiKey()
-    if apiKey ~= "" then
-        headers["Authorization"] = "Bearer " .. apiKey
+    local url = DISCORD_API .. "/channels/" .. SETTINGS.ChannelId .. "/messages?limit=10"
+    if lastSeenMessageId then
+        url = url .. "&after=" .. lastSeenMessageId
     end
 
     local success, response = pcall(function()
-        return HttpService:PostAsync(
-            apiUrl .. "/api/chat",
-            HttpService:JSONEncode(requestBody),
-            Enum.HttpContentType.ApplicationJson,
-            headers
-        )
+        return HttpService:RequestAsync({
+            Url = url,
+            Method = "GET",
+            Headers = {
+                ["Authorization"] = "Bot " .. SETTINGS.BotToken,
+                ["Content-Type"] = "application/json",
+            },
+        })
     end)
 
     if not success then
-        statusLabel.Text = "Connection failed. Check URL and tunnel."
-        addMessageBubble("assistant", "Could not connect to the backend. Make sure:\n1. Backend is running (npm start)\n2. Tunnel is active\n3. URL is correct in settings", nil)
-        isWaiting = false
-        sendButton.BackgroundColor3 = THEME.Accent
+        statusLabel.Text = "Status: Request failed"
         return
     end
 
-    local ok, data = pcall(function()
-        return HttpService:JSONDecode(response)
-    end)
-
-    if not ok or data.error then
-        statusLabel.Text = "Error from backend"
-        addMessageBubble("assistant", data and data.error or "Unknown error", nil)
-        isWaiting = false
-        sendButton.BackgroundColor3 = THEME.Accent
+    if response.StatusCode == 401 then
+        statusLabel.Text = "Status: Invalid bot token"
+        stopPolling()
+        return
+    elseif response.StatusCode == 403 then
+        statusLabel.Text = "Status: No access to channel"
+        stopPolling()
+        return
+    elseif response.StatusCode ~= 200 then
+        statusLabel.Text = "Status: HTTP " .. tostring(response.StatusCode)
         return
     end
 
-    -- Add AI response
-    addMessageBubble("assistant", data.reply, data.script)
+    local messages = decodeJsonSafe(response.Body)
+    if not messages or #messages == 0 then return end
 
-    -- Update history
-    table.insert(conversationHistory, { role = "user", content = message })
-    table.insert(conversationHistory, { role = "assistant", content = data.reply })
-
-    -- Keep history manageable (last 20 messages)
-    if #conversationHistory > 20 then
-        conversationHistory = table.move(conversationHistory, #conversationHistory - 19, #conversationHistory, 1, {})
+    -- Messages are newest-first; process oldest-first for correct order
+    for i = #messages, 1, -1 do
+        local msg = messages[i]
+        -- Skip bot's own messages or empty
+        if msg.content and msg.content ~= "" then
+            local snippet = parseSnippetPayload(msg.content)
+            if snippet then
+                -- Insert into Studio
+                local ok, script = pcall(insertSnippet, snippet)
+                if ok then
+                    addSnippetToLog(snippet, msg)
+                    statusLabel.Text = "Status: Inserted " .. (snippet.title or "snippet")
+                else
+                    statusLabel.Text = "Status: Insert failed"
+                end
+            end
+        end
     end
 
-    statusLabel.Text = ""
-    isWaiting = false
-    sendButton.BackgroundColor3 = THEME.Accent
+    -- Update last seen to newest message
+    lastSeenMessageId = messages[1].id
+    statusLabel.Text = "Status: Monitoring..."
 end
 
------------------------------------------------------
--- Connect events
------------------------------------------------------
-sendButton.MouseButton1Click:Connect(sendMessage)
-
-inputBox.FocusLost:Connect(function(enterPressed)
-    if enterPressed then
-        sendMessage()
+function startPolling()
+    if isPolling then return end
+    if SETTINGS.BotToken == "" or SETTINGS.ChannelId == "" then
+        statusLabel.Text = "Status: Configure token & channel first"
+        return
     end
-end)
 
-sendButton.MouseEnter:Connect(function()
-    if not isWaiting then
-        sendButton.BackgroundColor3 = THEME.AccentHover
-    end
-end)
+    isPolling = true
+    statusLabel.Text = "Status: Monitoring..."
 
-sendButton.MouseLeave:Connect(function()
-    if not isWaiting then
-        sendButton.BackgroundColor3 = THEME.Accent
-    end
-end)
-
--- Settings toggle
-settingsButton.MouseButton1Click:Connect(function()
-    settingsPanel.Visible = not settingsPanel.Visible
-end)
-
-saveSettingsBtn.MouseButton1Click:Connect(function()
-    setApiUrl(apiInput.Text)
-    setApiKey(keyInput.Text)
-    settingsPanel.Visible = false
-    statusLabel.Text = "Settings saved"
-    task.delay(2, function()
-        if statusLabel.Text == "Settings saved" then
-            statusLabel.Text = ""
+    pollThread = task.spawn(function()
+        while isPolling do
+            pollDiscord()
+            task.wait(POLL_INTERVAL)
         end
     end)
-end)
+end
 
--- Welcome message
-addMessageBubble("assistant", "Welcome to Nebula AI!\n\nTo get started:\n1. Click the [S] button to open settings\n2. Enter your backend URL (from localtunnel/ngrok)\n3. Select objects in your game and ask me anything!\n\nTry: \"Make this part spin\" or \"Create a leaderboard script\"", nil)
+function stopPolling()
+    isPolling = false
+    if pollThread then
+        task.cancel(pollThread)
+        pollThread = nil
+    end
+    statusLabel.Text = "Status: Paused"
+end
+
+-- ===== Init =====
+if SETTINGS.AutoRefresh and SETTINGS.BotToken ~= "" and SETTINGS.ChannelId ~= "" then
+    startPolling()
+else
+    statusLabel.Text = "Status: Configure settings to start"
+end
+
+widget.Title = "Nebula AI - Ready"
