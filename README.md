@@ -104,6 +104,7 @@ Pre-built scripts you can grab instantly:
 |---------|-------------|
 | Day Night Cycle | Automatic sky lighting with configurable time speed |
 | D20 Roll | Animated dice roller with nat 20/1 support |
+The Other two are just test snippets, more of like plugins for my own use.
 
 Ask me for a snippet by name and I'll send it to your channel.
 
